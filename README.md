@@ -1,63 +1,58 @@
 # Prediction Market Analysis
 
-A framework for analyzing prediction market data, including the largest publicly available dataset of Polymarket and Kalshi market and trade data. Provides tools for data collection, storage, and running analysis scripts that generate figures and statistics.
+> Forked from [jon-becker/prediction-market-analysis](https://github.com/jon-becker/prediction-market-analysis) — the largest publicly available dataset of Polymarket and Kalshi prediction market data (36GiB of trades and market metadata). All original data collection infrastructure, analysis framework, and datasets are the work of [Jon Becker](https://github.com/jon-becker).
 
 ## Overview
 
-This project enables research and analysis of prediction markets by providing:
-- Pre-collected datasets from Polymarket and Kalshi
-- Data collection indexers for gathering new data
-- Analysis framework for generating figures and statistics
+A framework for collecting, analyzing, and backtesting prediction market data from Kalshi and Polymarket. The original project provides data collection indexers, Parquet-based storage, and an extensible analysis script framework. This fork adds a backtesting engine for developing and evaluating trading strategies on historical data.
 
-Currently supported features:
-- Market metadata collection (Kalshi & Polymarket)
-- Trade history collection via API and blockchain
+## Features
+
+- Pre-collected datasets from Polymarket and Kalshi (36GiB compressed)
+- Data collection indexers for Kalshi API and Polymarket blockchain
 - Parquet-based storage with automatic progress saving
-- Extensible analysis script framework
+- Extensible analysis script framework (`make analyze`)
+- **Backtesting engine with strategy framework and research analytics** *(fork addition)*
 
-## Installation & Usage
+## Additions in This Fork
 
-Requires Python 3.9+. Install dependencies with [uv](https://github.com/astral-sh/uv):
+### Backtesting Engine
 
-```bash
-uv sync
-```
+Chronological trade replay engine (`src/backtesting/engine.py`) that walks through historical trades in timestamp order, feeding each to a pluggable strategy. Resolves positions against actual market outcomes with no lookahead bias. Supports per-market exposure limits to prevent concentration risk.
 
-Download and extract the pre-collected dataset (36GiB compressed):
+- DuckDB-powered Parquet queries for fast data loading
+- Portfolio tracker with position averaging, bankroll enforcement, and settlement
+- Platform fee models — Kalshi (7% profit fee) and Polymarket (2% winnings fee)
+- Performance metrics — Sharpe ratio, max drawdown, profit factor, win rate, equity curves, P&L by category
+- Kelly criterion position sizing with fractional Kelly (0.15x) and configurable max-bet caps
 
-```bash
-make setup
-```
+### Strategy Framework
 
-This downloads `data.tar.zst` from [Cloudflare R2 Storage](https://s3.jbecker.dev/data.tar.zst) and extracts it to `data/`.
+Abstract `Strategy` base class (`src/backtesting/strategy.py`) with:
+- `on_trade(ctx: TradeContext) -> StrategyDecision` — receives price, side, volume, ticker, and current bankroll for each trade
+- `on_resolution(ticker, result)` — callback when a market resolves, for state cleanup
+- Signal types: `BUY_YES`, `BUY_NO`, `SKIP`
+- Real-time bankroll tracking — strategies can adapt sizing to current portfolio value
 
-### Data Collection
+### Implemented Strategies
 
-Collect market and trade data from prediction market APIs:
+- **Longshot Fade** (`src/backtesting/strategies/longshot_fade.py`) — bets against extreme prices (below 15c or above 85c) where markets are systematically overconfident on longshots. Once-per-market entry with conservative Kelly sizing.
+- **Calibration Mispricing** (`src/backtesting/strategies/mispricing.py`) — trades based on empirical calibration gaps between market-implied probability and actual win frequency. Accepts either hardcoded defaults or a fitted calibration curve from historical data. Interpolates edge between calibration points.
 
-```bash
-make index
-```
+### Research Analytics
 
-This opens an interactive menu to select which indexer to run. Data is saved to `data/kalshi/` and `data/polymarket/` directories. Progress is saved automatically, so you can interrupt and resume collection.
+- **Calibration curve** (`src/backtesting/calibration.py`) — fits predicted probability vs realized win frequency from historical data, producing the core research plot that shows where and how markets misprice. Points sized by sample count, with mispricing zones highlighted.
+- **6-panel backtest figure** — calibration curve, equity curves, return comparison, P&L by category, win rate vs Sharpe scatter, and summary metrics table
+- **Fitted calibration offsets** — data-driven edge estimates fed directly into the mispricing strategy, replacing guesswork with empirical measurement
 
-### Running Analyses
+### Data Pipeline
 
-```bash
-make analyze
-```
+- **Sample data fetcher** (`scripts/fetch_sample_data.py`) — pulls ~300 resolved markets across 3 time windows from the Kalshi API, so you can run backtests without downloading the full 36GiB dataset
+- Auto-category mapping from event tickers using the existing categories utility
 
-This opens an interactive menu to select which analysis to run. You can run all analyses or select a specific one. Output files (PNG, PDF, CSV, JSON) are saved to `output/`.
+### Testing
 
-### Packaging Data
-
-To compress the data directory for storage/distribution:
-
-```bash
-make package
-```
-
-This creates a zstd-compressed tar archive (`data.tar.zst`) and removes the `data/` directory.
+33 tests (`tests/test_backtesting.py`) covering portfolio mechanics, fee models, position sizing, calibration fitting, strategy behavior, engine integration, exposure limits, and bankroll tracking. Uses conftest.py fixtures with synthetic Parquet data.
 
 ## Project Structure
 
@@ -66,40 +61,90 @@ This creates a zstd-compressed tar archive (`data.tar.zst`) and removes the `dat
 │   ├── analysis/           # Analysis scripts
 │   │   ├── kalshi/         # Kalshi-specific analyses
 │   │   └── polymarket/     # Polymarket-specific analyses
+│   ├── backtesting/        # Backtesting engine (fork addition)
+│   │   ├── engine.py       # Chronological trade replay engine
+│   │   ├── strategy.py     # Strategy base class + signals
+│   │   ├── portfolio.py    # Position tracking + P&L resolution
+│   │   ├── metrics.py      # Sharpe, max drawdown, profit factor
+│   │   ├── sizing.py       # Kelly criterion + fixed position sizing
+│   │   ├── fees.py         # Kalshi/Polymarket fee models
+│   │   ├── calibration.py  # Calibration curve fitting + plotting data
+│   │   └── strategies/     # Built-in strategies
+│   │       ├── longshot_fade.py
+│   │       └── mispricing.py
 │   ├── indexers/           # Data collection indexers
 │   │   ├── kalshi/         # Kalshi API client and indexers
 │   │   └── polymarket/     # Polymarket API/blockchain indexers
 │   └── common/             # Shared utilities and interfaces
 ├── data/                   # Data directory (extracted from data.tar.zst)
-│   ├── kalshi/
-│   │   ├── markets/
-│   │   └── trades/
-│   └── polymarket/
-│       ├── blocks/
-│       ├── markets/
-│       └── trades/
+├── scripts/
+│   └── fetch_sample_data.py  # Fetch sample from Kalshi API
+├── tests/
+│   └── test_backtesting.py   # Backtesting framework tests
 ├── docs/                   # Documentation
 └── output/                 # Analysis outputs (figures, CSVs)
 ```
 
-## Documentation
+## Running the Project
 
-- [Data Schemas](docs/SCHEMAS.md) - Parquet file schemas for markets and trades
-- [Writing Analyses](docs/ANALYSIS.md) - Guide for writing custom analysis scripts
+Requires Python 3.9+. Install dependencies with [uv](https://github.com/astral-sh/uv):
 
-## Contributing
+```bash
+uv sync
+```
 
-If you'd like to contribute to this project, please open a pull-request with your changes, as well as detailed information on what is changed, added, or improved.
+**Option A — Use the full dataset (36GiB):**
 
-For more information, see the [contributing guide](CONTRIBUTING.md).
+```bash
+make setup     # Download and extract data
+make analyze   # Run analyses (select backtest_strategies)
+```
 
-## Issues
+**Option B — Use a sample (no large download):**
 
-If you've found an issue or have a question, please open an issue [here](https://github.com/jon-becker/prediction-market-analysis/issues).
+```bash
+uv run python3 scripts/fetch_sample_data.py   # Fetch ~300 markets from Kalshi API
+make analyze                                    # Select backtest_strategies
+```
+
+**Programmatic usage:**
+
+```python
+from src.backtesting import BacktestEngine, KalshiFees
+from src.backtesting.strategies.longshot_fade import LongshotFade
+
+engine = BacktestEngine(
+    trades_dir="data/sample/trades",
+    markets_dir="data/sample/markets",
+    strategy=LongshotFade(low_threshold=15, high_threshold=85),
+    fee_model=KalshiFees(),
+    initial_bankroll=10_000.0,
+)
+result = engine.run()
+print(f"Return: {result.metrics.total_return_pct:.2f}%")
+print(f"Sharpe: {result.metrics.sharpe_ratio:.2f}")
+```
+
+## Research Goals
+
+- Quantify prediction market calibration — where do market prices diverge from actual outcome frequencies?
+- Develop systematic strategies that exploit persistent mispricing patterns
+- Measure the impact of platform fees on strategy viability
+- Understand which market categories (politics, finance, sports, crypto) offer the most consistent edges
+
+## Future Work
+
+- Walk-forward optimization with train/test splits to avoid overfitting calibration
+- Multi-platform backtesting (Polymarket support)
+- Limit order simulation and slippage modeling
+- Live paper trading integration with the Kalshi API
+- More strategies: momentum, mean-reversion, cross-market arbitrage
+
+## License
+
+See the original repository for license information.
 
 ## Research & Citations
 
-- Becker, J. (2026). _The Microstructure of Wealth Transfer in Prediction Markets_. Jbecker. https://jbecker.dev/research/prediction-market-microstructure
-- Le, N. A. (2026). _Decomposing Crowd Wisdom: Domain-Specific Calibration Dynamics in Prediction Markets_. arXiv. https://arxiv.org/abs/2602.19520
-
-If you have used or plan to use this dataset in your research, please reach out via [email](mailto:jonathan@jbecker.dev) or [Twitter](https://x.com/BeckerrJon) -- i'd love to hear about what you're using the data for! Additionally, feel free to open a PR and update this section with a link to your paper.
+- Becker, J. (2026). _The Microstructure of Wealth Transfer in Prediction Markets_. https://jbecker.dev/research/prediction-market-microstructure
+- Le, N. A. (2026). _Decomposing Crowd Wisdom: Domain-Specific Calibration Dynamics in Prediction Markets_. https://arxiv.org/abs/2602.19520
