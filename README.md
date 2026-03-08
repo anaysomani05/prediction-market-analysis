@@ -4,7 +4,7 @@
 
 ## Overview
 
-Collect, analyze, and backtest prediction market data from Kalshi and Polymarket. The original project handles data collection and analysis over 36GiB of market and trade data. This fork adds a backtesting engine for running trading strategies on historical data.
+Collect, analyze, and backtest prediction market data from Kalshi and Polymarket. The original project handles data collection and analysis over 36GiB of market and trade data. This fork adds a backtesting engine with out-of-sample validation, running trading strategies on historical data from both platforms.
 
 ## Features
 
@@ -12,17 +12,18 @@ Collect, analyze, and backtest prediction market data from Kalshi and Polymarket
 - Data collection indexers for Kalshi API and Polymarket blockchain
 - Parquet storage with automatic progress saving
 - Analysis script framework (`make analyze`)
-- Backtesting engine with strategy framework *(fork addition)*
+- Backtesting engine with OOS train/test split and per-platform fee models *(fork addition)*
 
 ## Additions in This Fork
 
 ### Backtesting Engine
 
-Replays historical trades chronologically, feeding each to a pluggable strategy and resolving positions against actual outcomes. No lookahead bias.
+Replays historical trades chronologically, feeding each to a pluggable strategy and resolving positions against actual outcomes.
 
+- **Train/test split** — calibration fitted on first 2/3 of markets, evaluated out-of-sample on the last 1/3 to prevent overfitting
+- **Per-platform execution** — runs Kalshi and Polymarket separately with their own fee models (KalshiFees 7% profit fee, PolymarketFees 2% winnings fee)
 - DuckDB-powered Parquet queries
 - Portfolio tracking with bankroll enforcement and position averaging
-- Fee models for Kalshi (7% profit fee) and Polymarket (2% winnings fee)
 - Metrics: Sharpe ratio, max drawdown, profit factor, win rate, equity curves, P&L by category
 - Kelly criterion sizing with fractional Kelly and max-bet caps
 - Per-market exposure limits
@@ -44,7 +45,8 @@ Replays historical trades chronologically, feeding each to a pluggable strategy 
 
 ### Data Pipeline
 
-- **Sample fetcher** (`scripts/fetch_sample_data.py`) — pulls ~300 resolved markets from Kalshi API across 3 time windows, no need to download the full dataset
+- **Sample fetcher** (`scripts/fetch_sample_data.py`) — pulls ~1000 resolved Kalshi markets and ~500 Polymarket markets from public APIs using dynamic rolling time windows
+- **Polymarket normalization** — converts Polymarket trades (Gamma API + Data API) into Kalshi-compatible format so the engine runs on both without changes
 - Auto-category mapping from event tickers
 
 ### Testing
