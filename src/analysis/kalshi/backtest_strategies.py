@@ -2,7 +2,11 @@
 
 Runs longshot-fade and mispricing strategies through the backtesting engine,
 produces equity curves, compares performance metrics, and shows P&L by category.
-Supports fitting the calibration curve from the actual data.
+
+Uses a proper train/test split: the calibration curve is fitted on markets
+that closed *before* a cutoff date, then the fitted strategy is evaluated
+only on markets that closed *after* that date.  This prevents look-ahead
+bias and gives an honest out-of-sample estimate.
 """
 
 from __future__ import annotations
@@ -10,13 +14,14 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import duckdb
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from src.backtesting.calibration import calibration_curve_data, fit_calibration
 from src.backtesting.engine import BacktestEngine
-from src.backtesting.fees import KalshiFees, NoFees
+from src.backtesting.fees import FeeModel, KalshiFees, NoFees, PolymarketFees
 from src.backtesting.metrics import BacktestMetrics
 from src.backtesting.sizing import FixedSizer, KellySizer
 from src.backtesting.strategies.longshot_fade import LongshotFade
@@ -25,52 +30,125 @@ from src.common.analysis import Analysis, AnalysisOutput
 from src.common.interfaces.chart import ChartConfig, ChartType, UnitType
 
 
+def _find_train_test_cutoff(markets_dir: Path | str) -> str:
+    """Pick a cutoff so the last time-window becomes the test set.
+
+    Finds the median close_time of the last third of markets
+    (sorted by close_time) and returns the boundary timestamp.
+    """
+    con = duckdb.connect()
+    # Get distinct close months and pick the start of the last window
+    df = con.execute(
+        f"""
+        SELECT close_time
+        FROM '{markets_dir}/*.parquet'
+        WHERE status = 'finalized' AND result IN ('yes', 'no')
+        ORDER BY close_time
+        """
+    ).df()
+    if len(df) < 10:
+        # Not enough data to split — use midpoint
+        mid = len(df) // 2
+        return str(df.iloc[mid]["close_time"])
+    # Use the last third as test set
+    cutoff_idx = len(df) * 2 // 3
+    return str(df.iloc[cutoff_idx]["close_time"])
+
+
 class BacktestStrategiesAnalysis(Analysis):
-    """Run and compare backtesting strategies on Kalshi data."""
+    """Run and compare backtesting strategies on prediction market data.
+
+    Runs each platform (Kalshi, Polymarket) separately with its own fee
+    model, then reports all results together.
+    """
 
     def __init__(
         self,
         trades_dir: Path | str | None = None,
         markets_dir: Path | str | None = None,
+        poly_trades_dir: Path | str | None = None,
+        poly_markets_dir: Path | str | None = None,
         initial_bankroll: float = 10_000.0,
     ):
         super().__init__(
             name="backtest_strategies",
-            description="Backtest trading strategies (longshot fade, mispricing) on Kalshi data",
+            description="Backtest trading strategies on prediction market data",
         )
         base_dir = Path(__file__).parent.parent.parent.parent
         self.trades_dir = Path(trades_dir or base_dir / "data" / "kalshi" / "trades")
         self.markets_dir = Path(markets_dir or base_dir / "data" / "kalshi" / "markets")
+        self.poly_trades_dir = Path(poly_trades_dir) if poly_trades_dir else None
+        self.poly_markets_dir = Path(poly_markets_dir) if poly_markets_dir else None
         self.initial_bankroll = initial_bankroll
 
-    def run(self) -> AnalysisOutput:
-        # Fit calibration from actual data
-        with self.progress("Fitting calibration curve"):
-            calibration = fit_calibration(self.trades_dir, self.markets_dir)
-            cal_df = calibration_curve_data(self.trades_dir, self.markets_dir)
-
-        max_exposure = self.initial_bankroll * 0.05  # 5% max per market
+    def _run_platform(
+        self,
+        platform: str,
+        trades_dir: Path,
+        markets_dir: Path,
+        fee_model: FeeModel,
+        calibration: dict[int, float],
+        cutoff_ts: str,
+    ) -> list[tuple[str, BacktestMetrics]]:
+        """Run all strategies for a single platform."""
+        max_exposure = self.initial_bankroll * 0.05
 
         strategies = [
-            ("Longshot Fade (no fees)", LongshotFade(), NoFees()),
-            ("Longshot Fade (Kalshi fees)", LongshotFade(), KalshiFees()),
-            ("Mispricing/default (Kalshi fees)", MispricingStrategy(), KalshiFees()),
-            ("Mispricing/fitted (Kalshi fees)", MispricingStrategy(calibration=calibration), KalshiFees()),
+            (f"{platform} Longshot Fade", LongshotFade(), fee_model),
+            (f"{platform} Mispricing/default", MispricingStrategy(), fee_model),
+            (f"{platform} Mispricing/fitted", MispricingStrategy(calibration=calibration), fee_model),
         ]
 
         results = []
         for name, strat, fees in strategies:
             with self.progress(f"Running {name}"):
                 engine = BacktestEngine(
-                    trades_dir=self.trades_dir,
-                    markets_dir=self.markets_dir,
+                    trades_dir=trades_dir,
+                    markets_dir=markets_dir,
                     strategy=strat,
                     fee_model=fees,
                     initial_bankroll=self.initial_bankroll,
                     max_exposure_per_market=max_exposure,
+                    min_close_ts=cutoff_ts,
                 )
                 result = engine.run()
                 results.append((name, result.metrics))
+
+        return results
+
+    def run(self) -> AnalysisOutput:
+        # Build list of platforms to run
+        platforms: list[tuple[str, Path, Path, FeeModel]] = [
+            ("Kalshi", self.trades_dir, self.markets_dir, KalshiFees()),
+        ]
+        if (self.poly_trades_dir and self.poly_markets_dir
+                and self.poly_trades_dir.exists() and self.poly_markets_dir.exists()):
+            platforms.append(
+                ("Polymarket", self.poly_trades_dir, self.poly_markets_dir, PolymarketFees()),
+            )
+
+        # Use the first platform for calibration fitting (largest dataset)
+        train_trades = self.trades_dir
+        train_markets = self.markets_dir
+
+        with self.progress("Computing train/test split"):
+            cutoff_ts = _find_train_test_cutoff(train_markets)
+
+        with self.progress("Fitting calibration curve (train set only)"):
+            calibration = fit_calibration(
+                train_trades, train_markets, max_close_ts=cutoff_ts,
+            )
+            cal_df = calibration_curve_data(train_trades, train_markets)
+
+        # Run each platform with its own fee model
+        results: list[tuple[str, BacktestMetrics]] = []
+        for platform, t_dir, m_dir, fees in platforms:
+            with self.progress(f"Computing {platform} train/test split"):
+                plat_cutoff = _find_train_test_cutoff(m_dir)
+            plat_results = self._run_platform(
+                platform, t_dir, m_dir, fees, calibration, plat_cutoff,
+            )
+            results.extend(plat_results)
 
         fig = self._create_figure(results, cal_df)
         df = self._create_dataframe(results)
@@ -82,7 +160,7 @@ class BacktestStrategiesAnalysis(Analysis):
         fig = plt.figure(figsize=(16, 16))
         gs = fig.add_gridspec(4, 2, hspace=0.40, wspace=0.3)
 
-        colors = ["#2ecc71", "#27ae60", "#e74c3c", "#c0392b"]
+        colors = ["#2ecc71", "#27ae60", "#1abc9c", "#e74c3c", "#c0392b", "#e67e22"]
 
         # 1. Calibration curve — predicted vs realized probability
         ax = fig.add_subplot(gs[0, :])

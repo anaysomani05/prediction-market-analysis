@@ -46,6 +46,7 @@ class BacktestEngine:
         initial_bankroll: float = 10_000.0,
         category_map: dict[str, str] | None = None,
         max_exposure_per_market: float = 0.0,
+        min_close_ts: str | None = None,
     ):
         self.trades_dir = Path(trades_dir)
         self.markets_dir = Path(markets_dir)
@@ -55,18 +56,23 @@ class BacktestEngine:
         self.initial_bankroll = initial_bankroll
         self.category_map = category_map
         self.max_exposure_per_market = max_exposure_per_market
+        self.min_close_ts = min_close_ts
 
     def run(self) -> BacktestResult:
         """Execute the backtest: load data, replay trades, resolve markets."""
         con = duckdb.connect()
 
         # Load resolved markets into a lookup
+        close_filter = (
+            f"AND close_time >= '{self.min_close_ts}'" if self.min_close_ts else ""
+        )
         markets_df = con.execute(
             f"""
             SELECT ticker, result, event_ticker
             FROM '{self.markets_dir}/*.parquet'
             WHERE status = 'finalized'
               AND result IN ('yes', 'no')
+              {close_filter}
             """
         ).df()
 

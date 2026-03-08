@@ -18,8 +18,17 @@ def _calibration_query(
     markets_dir: Path | str,
     bin_width: int,
     min_samples: int,
+    max_close_ts: str | None = None,
 ) -> pd.DataFrame:
-    """Run the calibration SQL and return raw DataFrame."""
+    """Run the calibration SQL and return raw DataFrame.
+
+    Args:
+        max_close_ts: If set, only include markets that closed before this
+            ISO-8601 timestamp.  Used to enforce train/test separation.
+    """
+    close_filter = (
+        f"AND close_time < '{max_close_ts}'" if max_close_ts else ""
+    )
     con = duckdb.connect()
     return con.execute(
         f"""
@@ -28,6 +37,7 @@ def _calibration_query(
             FROM '{markets_dir}/*.parquet'
             WHERE status = 'finalized'
               AND result IN ('yes', 'no')
+              {close_filter}
         ),
         taker_positions AS (
             SELECT
@@ -55,6 +65,7 @@ def fit_calibration(
     markets_dir: Path | str,
     bin_width: int = 5,
     min_samples: int = 20,
+    max_close_ts: str | None = None,
 ) -> dict[int, float]:
     """Compute calibration offsets from historical data.
 
@@ -66,11 +77,13 @@ def fit_calibration(
         markets_dir: Path to Parquet market files.
         bin_width: Width of price bins in cents.
         min_samples: Minimum trades per bin to include.
+        max_close_ts: If set, only use markets that closed before this
+            ISO-8601 timestamp (for train/test separation).
 
     Returns:
         Dict mapping price_cents -> edge (actual_win_rate - implied_prob).
     """
-    df = _calibration_query(trades_dir, markets_dir, bin_width, min_samples)
+    df = _calibration_query(trades_dir, markets_dir, bin_width, min_samples, max_close_ts)
 
     calibration: dict[int, float] = {}
     for _, row in df.iterrows():
